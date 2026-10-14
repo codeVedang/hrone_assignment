@@ -8,7 +8,7 @@ from datetime import date as Date, datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Annotated, Literal
 
-from bson import Decimal128, ObjectId, json_util
+from bson import Decimal128, json_util
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
@@ -139,13 +139,11 @@ def epoch_ms(value):
 
 
 def json_value(value):
-    """Convert dates at every depth, including history and raw explain output."""
+    """Convert database dates and decimals, including dates nested in history."""
     if isinstance(value, datetime):
         return epoch_ms(value)
     if isinstance(value, Decimal128):
         return float(value.to_decimal())
-    if isinstance(value, ObjectId):
-        return str(value)  # Only explain may contain MongoDB internal identifiers.
     if isinstance(value, dict):
         return {k: json_value(v) for k, v in value.items()}
     if isinstance(value, list):
@@ -160,12 +158,16 @@ FIELDS = ["status", "punch_in", "punch_out", "work_hours", "late_minutes",
 
 
 def attendance_json(doc):
-    return json_value({k: doc.get(k, DEFAULTS.get(k))
-                       for k in ["emp_code", "date", *FIELDS, "history"]})
+    record = {}
+    for field in ["emp_code", "date", *FIELDS, "history"]:
+        record[field] = doc.get(field, DEFAULTS.get(field))
+    return json_value(record)
 
 
 def employee_json(doc):
-    return json_value({k: doc[k] for k in EmployeeIn.model_fields} | {"created_at": doc["created_at"]})
+    record = {field: doc[field] for field in EmployeeIn.model_fields}
+    record["created_at"] = doc["created_at"]
+    return json_value(record)
 
 
 def employee(code):
@@ -209,28 +211,43 @@ def compute_overtime(punch_out, end):
 def derived(doc, emp):
     if doc["status"] not in PRESENCE:
         return {k: v for k, v in DEFAULTS.items() if k != "history"}
-    pi, po = doc.get("punch_in"), doc.get("punch_out")
-    if pi is None:
+    punch_in = doc.get("punch_in")
+    punch_out = doc.get("punch_out")
+    if punch_in is None:
         raise HTTPException(422, "presence requires punch_in")
-    if attendance_day(pi, emp) != doc["date"]:
+    if attendance_day(punch_in, emp) != doc["date"]:
         raise HTTPException(422, "punch_in must stay on the attendance date")
     start, end = shift_bounds(emp, doc["date"])
-    work = None
-    if po is not None:
-        if not pi < po <= pi + timedelta(hours=24):
+    work_hours = None
+    overtime_minutes = 0
+    half_day = False
+    if punch_out is not None:
+        if not punch_in < punch_out <= punch_in + timedelta(hours=24):
             raise HTTPException(422, "punch_out must be after punch_in and within 24 hours")
-        work = compute_work_hours(pi, po)
-    return {"punch_in": pi, "punch_out": po, "work_hours": work,
-            "late_minutes": compute_late_minutes(pi, start),
-            "overtime_minutes": compute_overtime(po, end) if po else 0,
-            "half_day": work is not None and work < 4.5}
+        work_hours = compute_work_hours(punch_in, punch_out)
+        overtime_minutes = compute_overtime(punch_out, end)
+        half_day = work_hours < 4.5
+    return {
+        "punch_in": punch_in,
+        "punch_out": punch_out,
+        "work_hours": work_hours,
+        "late_minutes": compute_late_minutes(punch_in, start),
+        "overtime_minutes": overtime_minutes,
+        "half_day": half_day,
+    }
 
 
 def snapshot_filter(doc):
-    """Compare-and-swap every writable field, including the append-only history."""
-    return {"_id": doc["_id"]} | {
-        k: {"$eq": doc[k]} if k in doc else {"$exists": False}
-        for k in [*FIELDS, "history"]}
+    """Only update a record if it still matches the version we read."""
+    query = {"_id": doc["_id"]}
+    for field in [*FIELDS, "history"]:
+        if field in doc:
+            query[field] = {"$eq": doc[field]}
+        else:
+            # Legacy records may omit fields. A concurrent edit adding one
+            # must also cause this update to fail rather than overwrite it.
+            query[field] = {"$exists": False}
+    return query
 
 
 @app.get("/health")
@@ -312,8 +329,12 @@ def regularize(emp_code: str, date: DateString, body: RegularizeIn):
         if k in supplied:
             updated[k] = instant(supplied[k])
     updated.update(derived(updated | {"date": date}, emp))
-    changes = {k: {"from": old.get(k, DEFAULTS.get(k)), "to": updated[k]}
-               for k in FIELDS if old.get(k, DEFAULTS.get(k)) != updated[k]}
+    changes = {}
+    for field in FIELDS:
+        before = old.get(field, DEFAULTS.get(field))
+        after = updated[field]
+        if before != after:
+            changes[field] = {"from": before, "to": after}
     if not changes:
         raise HTTPException(422, "correction changes nothing")
     entry = {"at": now(), "by": body.regularized_by, "reason": body.reason, "changes": changes}
@@ -325,8 +346,12 @@ def regularize(emp_code: str, date: DateString, body: RegularizeIn):
 
 
 def checked_range(start, end, max_days=None):
-    if start and end and (start > end or (max_days and
-                              (Date.fromisoformat(end) - Date.fromisoformat(start)).days + 1 > max_days)):
+    if start is None or end is None:
+        return
+    if start > end:
+        raise HTTPException(422, "invalid date range")
+    days = (Date.fromisoformat(end) - Date.fromisoformat(start)).days + 1
+    if max_days is not None and days > max_days:
         raise HTTPException(422, "invalid date range")
 
 
@@ -385,9 +410,10 @@ def decimal_value(value):
 def half_up(value, places=2):
     """All analytics quantities are nonnegative; Decimal avoids binary midpoint drift."""
     scale = 10 ** places
-    return {"$cond": [{"$eq": [value, None]}, None,
-            {"$toDouble": {"$divide": [{"$floor": {"$add": [
-                {"$multiply": [decimal_value(value), scale]}, Decimal128("0.5")]}}, scale]}}]}
+    scaled_value = {"$multiply": [decimal_value(value), scale]}
+    rounded_integer = {"$floor": {"$add": [scaled_value, Decimal128("0.5")]}}
+    rounded_value = {"$toDouble": {"$divide": [rounded_integer, scale]}}
+    return {"$cond": [{"$eq": [value, None]}, None, rounded_value]}
 
 
 def ratio(numerator, denominator, places=2, multiplier=1):
