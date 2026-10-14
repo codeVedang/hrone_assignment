@@ -1,0 +1,9 @@
+.venv/
+.env
+.env.*
+__pycache__/
+.pytest_cache/
+*.py[cod]
+candidate-kit/
+.local/
+dist/
