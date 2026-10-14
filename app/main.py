@@ -1,5 +1,6 @@
 """Attendance contract v2: UTC storage, IST calendars, atomic writes and Mongo analytics."""
 import calendar
+import json
 import os
 import re
 from contextlib import asynccontextmanager
@@ -7,7 +8,7 @@ from datetime import date as Date, datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Annotated, Literal
 
-from bson import Decimal128, ObjectId
+from bson import Decimal128, ObjectId, json_util
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
@@ -575,4 +576,6 @@ def explain_endpoint(endpoint: ExplainEndpoint, emp_code: str | None = None, mon
         collection, pipeline, hint = spec
         command = {"aggregate": collection, "pipeline": pipeline, "cursor": {}, "hint": hint, "allowDiskUse": True}
     output = db.command("explain", command, verbosity="executionStats")
-    return {"endpoint": endpoint, "collection": collection, "explain": json_value(output)}
+    # Replica sets / Atlas also return BSON cluster timestamps and binary signatures.
+    # Extended JSON preserves those raw values without assuming standalone metadata.
+    return {"endpoint": endpoint, "collection": collection, "explain": json.loads(json_util.dumps(output))}

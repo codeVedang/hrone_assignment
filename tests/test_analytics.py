@@ -141,6 +141,20 @@ def test_unknown_resources(api):
     assert api.get("/analytics/departments/A/trend", params={"from": "2026-07-01", "to": "2026-07-01"}).status_code == 404
 
 
+def test_explain_replica_set_metadata_is_json_serializable(api, monkeypatch):
+    from bson import Binary, Timestamp
+    def command(*args, **kwargs):
+        return {"queryPlanner": {"winningPlan": {"stage": "IXSCAN"}},
+                "operationTime": Timestamp(1783311000, 1),
+                "$clusterTime": {"clusterTime": Timestamp(1783311000, 1),
+                                 "signature": {"hash": Binary(b"\xff\x00"), "keyId": 1}}}
+    with monkeypatch.context() as patch:
+        patch.setattr(main.db, "command", command)
+        result = api.get("/admin/explain/attendance_list")
+    assert result.status_code == 200
+    assert result.json()["explain"]["operationTime"]["$timestamp"]["t"] == 1783311000
+
+
 def test_randomized_monthly_and_trend_against_oracle(api, make_employee):
     rng = random.Random(20261014)
     employees, logs = [], []
